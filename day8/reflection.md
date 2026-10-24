@@ -1,0 +1,7 @@
+# Day 8 Reflection
+
+The most difficult concept in this course was understanding how separate parts of a system work together, especially how an API, database, and frontend share responsibility. At first, code and system-design terms could feel abstract. I overcame this by breaking a system into smaller parts, tracing what happens when a user makes a request, and practising with small projects instead of trying to understand everything at once. Drawing the flow also helped me see why the database must enforce important rules rather than relying only on what the interface displays.
+
+For my QuickNotes capstone, the feedback I received was to replace an empty introduction with a short explanation of what the application does. I would improve the project by making the purpose clearer from the first screen and checking that every section helps a new user understand how to use the application. I would also continue improving error and loading messages so users know what is happening when an API request is slow or fails.
+
+Next, I want to strengthen my JavaScript and API skills, particularly asynchronous requests, error handling, and how frontend code communicates with a backend. I also want to practise database transactions and constraints because TicketHub showed me how important they are for protecting data when many users act at the same time. My goal is not just to use tools to build projects, but to understand the decisions behind the code well enough to explain, test, and debug my own work.
