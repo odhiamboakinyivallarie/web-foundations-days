@@ -240,10 +240,222 @@ The load balancer distributes requests across multiple API instances. The instan
 **4. Redis cache**
 
 Stores frequently requested read data, such as event details. It reduces database load but is not the source of truth for seat ownership.
+### SQL table definitions (PostgreSQL)
+
+The following SQL statements show how the database tables are created, including their primary keys, foreign keys, data types, and constraints.
+
+```sql
+CREATE TABLE users (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name VARCHAR(150) NOT NULL,
+    email VARCHAR(255) NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE events (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name VARCHAR(200) NOT NULL,
+    venue VARCHAR(200) NOT NULL,
+    starts_at TIMESTAMP NOT NULL,
+    sale_starts_at TIMESTAMP NOT NULL,
+    status VARCHAR(20) NOT NULL
+        CHECK (status IN ('draft', 'on_sale', 'sold_out', 'cancelled')),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE seats (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    event_id BIGINT NOT NULL REFERENCES events(id),
+    section VARCHAR(50) NOT NULL,
+    row_label VARCHAR(20) NOT NULL,
+    seat_number VARCHAR(20) NOT NULL,
+    price DECIMAL(10,2) NOT NULL CHECK (price >= 0),
+    status VARCHAR(20) NOT NULL DEFAULT 'available'
+        CHECK (status IN ('available', 'held', 'sold')),
+    hold_expires_at TIMESTAMP,
+    hold_user_id BIGINT REFERENCES users(id),
+
+    UNIQUE (event_id, section, row_label, seat_number)
+);
+
+CREATE TABLE orders (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(id),
+    status VARCHAR(30) NOT NULL DEFAULT 'pending_payment'
+        CHECK (status IN (
+            'pending_payment', 'paid', 'failed',
+            'cancelled', 'refunded'
+        )),
+    total_amount DECIMAL(10,2) NOT NULL,
+    currency VARCHAR(3) NOT NULL DEFAULT 'KES',
+    idempotency_key VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    paid_at TIMESTAMP,
+
+    UNIQUE (user_id, idempotency_key)
+);
+
+CREATE TABLE order_items (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    order_id BIGINT NOT NULL REFERENCES orders(id),
+    seat_id BIGINT NOT NULL UNIQUE REFERENCES seats(id),
+    unit_price DECIMAL(10,2) NOT NULL,
+    ticket_code VARCHAR(255) UNIQUE
+);
+```
+
+**Explanation of the constraints:**
+
+- `PRIMARY KEY` uniquely identifies every record.
+- `FOREIGN KEY` connects related tables and maintains referential integrity.
+- `UNIQUE` prevents duplicate email addresses, duplicate seat definitions, duplicate order requests, and duplicate seat assignments.
+- `NOT NULL` ensures required information is provided.
+- `CHECK` restricts fields to valid values.
+- `DEFAULT` automatically supplies initial values where appropriate.
+
+The `order_items.seat_id` unique constraint provides an additional database-level safeguard against assigning one seat to multiple orders.
+
 
 **5. PostgreSQL primary database**
 
 Stores authoritative seat, hold, and order information. Transactions, row locks, and constraints protect against double-booking. Seat-changing operations must use the authoritative database.
+### Specific SQL transaction for preventing double-booking
+
+TicketHub uses PostgreSQL transactions and row-level locking to ensure that only one customer can hold a particular seat at a time.
+
+The following example assumes a customer wants seats 101 and 102 for event 5.
+
+#### Step 1: Start a transaction and lock the seats
+
+```sql
+BEGIN;
+
+SELECT id, status, hold_expires_at, hold_user_id
+FROM seats
+WHERE event_id = 5
+  AND id IN (101, 102)
+ORDER BY id
+FOR UPDATE;
+```
+
+`FOR UPDATE` locks the selected database rows until the transaction finishes.
+
+If another customer tries to modify the same seats, their request must wait until the first transaction commits or rolls back.
+
+#### Step 2: Check availability
+
+The backend checks the returned rows.
+
+A seat is eligible if:
+
+- Its status is `available`; OR
+- Its status is `held`, but its hold has expired.
+
+If either seat is unavailable, or the number of returned seats is not two, the backend executes:
+
+```sql
+ROLLBACK;
+```
+
+This cancels the transaction without reserving any seats.
+
+#### Step 3: Temporarily hold the seats
+
+If both seats are available, the backend executes:
+
+```sql
+UPDATE seats
+SET status = 'held',
+    hold_user_id = 25,
+    hold_expires_at = CURRENT_TIMESTAMP + INTERVAL '5 minutes'
+WHERE event_id = 5
+  AND id IN (101, 102)
+  AND (
+      status = 'available'
+      OR (
+          status = 'held'
+          AND hold_expires_at <= CURRENT_TIMESTAMP
+      )
+  );
+```
+
+The backend verifies that exactly two rows were updated. If not, it rolls back the transaction.
+
+#### Step 4: Commit the transaction
+
+```sql
+COMMIT;
+```
+
+The seats are now temporarily held by customer 25 for five minutes.
+
+#### Step 5: Confirm the purchase after successful payment
+
+The payment provider is contacted outside the database transaction. Once successful payment is verified, TicketHub starts another transaction:
+
+```sql
+BEGIN;
+
+SELECT id
+FROM seats
+WHERE id IN (101, 102)
+  AND status = 'held'
+  AND hold_user_id = 25
+  AND hold_expires_at > CURRENT_TIMESTAMP
+ORDER BY id
+FOR UPDATE;
+```
+
+The backend verifies that both seats still belong to the customer and that their holds are valid.
+
+It then updates their status:
+
+```sql
+UPDATE seats
+SET status = 'sold',
+    hold_user_id = NULL,
+    hold_expires_at = NULL
+WHERE id IN (101, 102)
+  AND status = 'held'
+  AND hold_user_id = 25
+  AND hold_expires_at > CURRENT_TIMESTAMP;
+```
+
+After checking that exactly two seats were updated, the backend updates the corresponding order to `paid` and creates the order items.
+
+```sql
+UPDATE orders
+SET status = 'paid',
+    paid_at = CURRENT_TIMESTAMP
+WHERE id = 200
+  AND user_id = 25
+  AND status = 'pending_payment';
+  INSERT INTO order_items (order_id, seat_id, unit_price)
+SELECT 200, id, price
+FROM seats
+WHERE id IN (101, 102);
+
+COMMIT;
+```
+
+The order items must also be inserted inside this transaction, before committing.
+
+If any validation or update fails, the transaction must roll back and the payment recovery process must handle the outcome safely.
+
+### Why this prevents double-booking
+
+Imagine two customers, A and B, trying to reserve seat 101 simultaneously.
+
+1. Customer A starts a transaction and locks seat 101.
+2. Customer B tries to lock the same seat but must wait.
+3. Customer A changes the seat status to `held` and commits.
+4. Customer B's request continues and sees that the seat is no longer available.
+5. Customer B receives a `409 Conflict` response.
+
+Therefore, both customers cannot successfully hold the same seat.
+
+**The key principle:** The database is the final authority on seat availability. Transactions, row-level locks, and unique constraints protect inventory even when many customers send requests at the same time.
 
 **6. Queue and background workers**
 
